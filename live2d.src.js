@@ -1,0 +1,517 @@
+/* ============================ Live2D（延迟加载） ============================ */
+/* ---------------- 拖动 + 点按换形象（内联模块） ---------------- */
+/* ==========================================================================
+   Live2D 增强：可拖动 + 点一下换形象
+   --------------------------------------------------------------------------
+   替换页面里原来的 L2Dwidget.init({...}) 调用：
+       Live2DHand.init();          // 位置、形象都会自动从上次记住的状态恢复
+   依赖：live2d-widget 3.x 已加载（window.L2Dwidget 存在）
+
+   为什么换形象用整页刷新，而不是原地重建：
+   live2d-widget 3.1.4 没有 destroy 接口（源码里 0 个 destroy），重复 init 会
+   多出一块 canvas 和一条动画循环；老循环画在已经摘掉的 canvas 上照样跑，
+   手机换几次就卡。刷新把旧文档整个丢掉，循环随之消失，代价是一下白屏。
+
+   浏览器要求：localStorage 可写（隐私模式可能抛错，已兜底为不记忆）。
+   ========================================================================== */
+(function (global) {
+  'use strict';
+
+  // 换形象的顺序表。点一下小人切到下一个；首访随机起始，之后记住。
+  // 加/减形象只动这里：pkg + ver + file 拼成资源地址（前缀见下面 CDNS）。
+  // ver 每个包不一样 —— umaru 2.0.0、rem 1.0.1、sagiri/mikoto 1.0.0，其余 1.0.5。
+  // 写错版本号会 404，加新形象前先用 assets/<name>.model.json 验一遍。
+  // 体积（11/15 实测，主纹理+动作+音效求和，弱网下越大越慢）：
+  //   z16 .23M / unitychan .38M / ni-j .66M / hibiki .69M / nico .90M / miku .95M
+  //   nipsilon 1.06M / mikoto 1.11M / sagiri 1.24M / tsumiki 1.31M / rem 1.33M
+  //   shizuku 2.60M / umaru 2.85M
+  var MODELS = [
+    { name: 'unitychan', pkg: 'live2d-widget-model-unitychan', ver: '1.0.5', file: 'unitychan.model.json' },
+    { name: 'shizuku',   pkg: 'live2d-widget-model-shizuku',   ver: '1.0.5', file: 'shizuku.model.json' },
+    { name: 'z16',       pkg: 'live2d-widget-model-z16',       ver: '1.0.5', file: 'z16.model.json' },
+    { name: 'hibiki',    pkg: 'live2d-widget-model-hibiki',    ver: '1.0.5', file: 'hibiki.model.json' },
+    { name: 'miku',      pkg: 'live2d-widget-model-miku',      ver: '1.0.5', file: 'miku.model.json' },
+    { name: 'nico',      pkg: 'live2d-widget-model-nico',      ver: '1.0.5', file: 'nico.model.json' },
+    { name: 'ni-j',      pkg: 'live2d-widget-model-ni-j',      ver: '1.0.5', file: 'ni-j.model.json' },
+    { name: 'nipsilon',  pkg: 'live2d-widget-model-nipsilon',  ver: '1.0.5', file: 'nipsilon.model.json' },
+    { name: 'tsumiki',   pkg: 'live2d-widget-model-tsumiki',   ver: '1.0.5', file: 'tsumiki.model.json' },
+    { name: 'umaru',     pkg: 'live2d-widget-model-umaru',     ver: '2.0.0', file: 'umaru.model.json' },
+    { name: 'rem',       pkg: 'live2d-widget-model-rem',       ver: '1.0.1', file: 'rem.model.json' },
+    { name: 'sagiri',    pkg: 'live2d-widget-model-sagiri',    ver: '1.0.0', file: 'sagiri.model.json' },
+    { name: 'mikoto',    pkg: 'live2d-widget-model-mikoto',    ver: '1.0.0', file: 'mikoto.model.json' }
+  ];
+
+  // 资源 CDN，按顺序试。jsdelivr 的三个域名轮着试完再退到 unpkg。
+  // 末尾两家是 jsdelivr 的国内公共反代 —— 公共镜像随时可能挂，只当最后兜底。
+  // ⚠️ 别再往这里加 npmmirror：阿里那套有包名白名单，live2d-widget-model-*
+  //    会被 403「is not allow to unpkg files」（11/15 实测）。
+  var CDNS = [
+    'https://fastly.jsdelivr.net/npm/',
+    'https://cdn.jsdelivr.net/npm/',
+    'https://gcore.jsdelivr.net/npm/',
+    'https://unpkg.com/',
+    'https://cdn.jsdmirror.com/npm/',
+    'https://jsd.onmicrosoft.cn/npm/'
+  ];
+  var PROBE_MS = 6000;   // 单次探 model.json 的上限
+  var WARM_MS  = 9000;   // 等主纹理进缓存的上限（超时也照样 init，别无限等）
+
+  var K_MODEL = 'l2d:model';   // 上次是第几个形象
+  var K_POS   = 'l2d:pos';     // 上次拖到的位置 {x,y}
+  var K_SWAP  = 'l2d:swapped'; // 刚换过形象（只用来弹一次名字）
+  var TAP_TOL = 6;             // 手指移动小于这个距离算「点一下」
+  var ATTACH_TIMEOUT = 15000;
+
+  /* ---- 预取 ----
+     实测：不切换时很快（走浏览器缓存），一按切换就慢 —— 因为新形象的全部资源
+     都是第一次下载。所以当前形象画出来之后，趁空闲把**下一个**形象的主纹理
+     先下进 HTTP 缓存，切换时就是缓存命中。
+     PREFETCH = 0 关掉；1 = 只备下一个；2 = 备下两个（流量翻倍）。 */
+  var PREFETCH = 1;
+  var PREFETCH_DELAY = 4000;   // 等首屏渲染完再开始，别抢带宽
+  var PREFETCH_TEX = 8;        // 每个形象预取几张纹理（shizuku 有 6 张，8 够用）
+                               // 想省流量就调到 2：只备 moc + 前两张，切换时仍要现下剩下的
+  var PREFETCH_MS = 20000;     // 单个文件的预取上限
+
+  function store(key, val) {
+    try {
+      if (val === undefined) return localStorage.getItem(key);
+      if (val === null) localStorage.removeItem(key);
+      else localStorage.setItem(key, val);
+    } catch (_) { /* 隐私模式写不进去，就别记忆 */ }
+    return null;
+  }
+
+  function readIndex() {
+    var i = parseInt(store(K_MODEL), 10);
+    if (!isFinite(i) || i < 0) i = Math.random() * MODELS.length | 0; // 第一次随机
+    return i % MODELS.length;
+  }
+
+  /* ---------------- 拖动 ---------------- */
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+  var state = null;   // 当前落点 {x,y}
+  var lockTimers = [];   // 组件初始化期间的重试计时器
+
+  function readStoredPos() {
+    var raw = store(K_POS);
+    if (!raw) return null;
+    try {
+      var p = JSON.parse(raw);
+      if (isFinite(p.x) && isFinite(p.y)) return p;
+    } catch (_) {}
+    return null;
+  }
+
+  function restorePos(host) {
+    var p = readStoredPos();
+    if (!p) {                      // 没存过：沿用页面 CSS 的右下角位置
+      var r = host.getBoundingClientRect();
+      p = { x: r.left, y: r.top };
+    }
+    state = p;
+    applyPos(host, p.x, p.y);
+  }
+
+  /* 组件建完 DOM 后还会整体改写一次 style（cssText），会把 left/top 一起抹掉，
+     而且改写时机不固定（有时在模型加载完之后）。所以盯住 style 属性：
+     一旦发现 left/top 不是我们写的值，就重新落位；自己写的那次会被值比对跳过，
+     不会自激。budget 兜底，避免和组件来回打架。 */
+  function lockPos(host) {
+    stopLock();
+    var budget = 15;
+
+    function target() {
+      var w = host.offsetWidth || 120, h = host.offsetHeight || 200;
+      return {
+        x: clamp(state.x, 0, Math.max(0, innerWidth - w)),
+        y: clamp(state.y, 0, Math.max(0, innerHeight - h))
+      };
+    }
+
+    function reapply() {
+      if (!state || budget <= 0) return;
+      var t = target();
+      if (host.style.getPropertyValue('left') === t.x + 'px' &&
+          host.style.getPropertyValue('top') === t.y + 'px') return;
+      budget--;
+      applyPos(host, t.x, t.y);
+    }
+
+    var mo = new MutationObserver(reapply);
+    mo.observe(host, { attributes: true, attributeFilter: ['style'] });
+    lockTimers.push(mo);
+    reapply();
+  }
+
+  function stopLock() {
+    lockTimers.forEach(function (t) {
+      if (t && t.disconnect) t.disconnect(); else clearTimeout(t);
+    });
+    lockTimers = [];
+  }
+
+  function applyPos(host, x, y) {
+    var w = host.offsetWidth || 120, h = host.offsetHeight || 200;
+    x = clamp(x, 0, Math.max(0, innerWidth - w));
+    y = clamp(y, 0, Math.max(0, innerHeight - h));
+    // 页面 CSS 里 right/bottom 带 !important，内联必须同样带 !important 才压得住
+    host.style.setProperty('left', x + 'px', 'important');
+    host.style.setProperty('top', y + 'px', 'important');
+    host.style.setProperty('right', 'auto', 'important');
+    host.style.setProperty('bottom', 'auto', 'important');
+    host.style.setProperty('touch-action', 'none', 'important');
+    host.style.setProperty('cursor', 'grab', 'important');
+  }
+
+  function bindDrag(host, onTap) {
+    var sx = 0, sy = 0, ox = 0, oy = 0, moved = false, active = false;
+
+    function down(e) {
+      if (!(host.contains(e.target) || e.target === host)) return;
+      if (e.button !== undefined && e.button !== 0) return;
+      active = true; moved = false;
+      var r = host.getBoundingClientRect();
+      ox = r.left; oy = r.top;
+      sx = e.clientX; sy = e.clientY;
+      stopLock();                    // 手一碰就接管，别再自动落位
+      host.style.setProperty('cursor', 'grabbing', 'important');
+    }
+
+    function move(e) {
+      if (!active) return;
+      var dx = e.clientX - sx, dy = e.clientY - sy;
+      if (!moved && Math.abs(dx) < TAP_TOL && Math.abs(dy) < TAP_TOL) return;
+      moved = true;
+      state = { x: ox + dx, y: oy + dy };
+      applyPos(host, state.x, state.y);
+      if (e.cancelable) e.preventDefault();
+    }
+
+    function up() {
+      if (!active) return;
+      active = false;
+      host.style.setProperty('cursor', 'grab', 'important');
+      if (moved) {
+        var r = host.getBoundingClientRect();
+        state = { x: Math.round(r.left), y: Math.round(r.top) };
+        store(K_POS, JSON.stringify(state));
+      } else {
+        onTap();
+      }
+    }
+
+    // 必须用捕获阶段：组件会在 canvas 上处理点击动作，冒泡阶段可能被它挡掉
+    document.addEventListener('pointerdown', down, true);
+    document.addEventListener('pointermove', move, true);
+    document.addEventListener('pointerup', up, true);
+    document.addEventListener('pointercancel', function () { active = false; }, true);
+
+    // 老内核没有 PointerEvent 时退回 touch
+    if (!('PointerEvent' in global)) {
+      document.addEventListener('touchstart', function (e) {
+        var t = e.touches[0];
+        down({ target: e.target, clientX: t.clientX, clientY: t.clientY });
+      }, { passive: true, capture: true });
+      document.addEventListener('touchmove', function (e) {
+        var t = e.touches[0];
+        move({ clientX: t.clientX, clientY: t.clientY, cancelable: e.cancelable, preventDefault: function () { e.preventDefault(); } });
+      }, { passive: false, capture: true });
+      document.addEventListener('touchend', up, true);
+      document.addEventListener('touchcancel', function () { active = false; }, true);
+    }
+  }
+
+  /* ---------------- 换形象 ---------------- */
+
+  function next() {
+    var i = (readIndex() + 1) % MODELS.length;
+    store(K_MODEL, String(i));
+    store(K_SWAP, '1');
+    location.reload();
+  }
+
+  /* ---------------- 换完弹一次名字 ---------------- */
+
+  function toastIfSwapped() {
+    if (store(K_SWAP) !== '1') return;
+    store(K_SWAP, null);
+    var d = document.createElement('div');
+    d.textContent = MODELS[readIndex()].name;
+    d.style.cssText = 'position:fixed;left:50%;bottom:84px;transform:translateX(-50%);' +
+      'padding:6px 14px;border-radius:999px;background:rgba(0,0,0,.55);color:#fff;' +
+      'font:13px/1.4 -apple-system,sans-serif;z-index:2147483647;pointer-events:none;' +
+      'opacity:1;transition:opacity .5s';
+    document.body.appendChild(d);
+    setTimeout(function () { d.style.opacity = '0'; }, 1100);
+    setTimeout(function () { if (d.parentNode) d.parentNode.removeChild(d); }, 1700);
+  }
+
+  /* ---------------- 等组件把 DOM 建出来 ---------------- */
+
+  function attach() {
+    var t0 = Date.now();
+    (function poll() {
+      var host = document.getElementById('live2d-widget');
+      if (host && host.offsetWidth) {
+        global.__l2dBound = true;
+        restorePos(host);
+        lockPos(host);
+        bindDrag(host, next);
+        // 转屏/缩放后把位置夹回可视区
+        var rt = 0;
+        global.addEventListener('resize', function () {
+          clearTimeout(rt);
+          rt = setTimeout(function () {
+            var r = host.getBoundingClientRect();
+            applyPos(host, r.left, r.top);
+          }, 150);
+        });
+        return;
+      }
+      if (Date.now() - t0 > ATTACH_TIMEOUT) return;   // 组件没起来就算了，别死循环
+      setTimeout(poll, 150);
+    })();
+  }
+
+  /* ---------------- 入口 ---------------- */
+
+  /* ---------------- 加载：先探地址、再预热纹理，最后才 init ---------------- */
+
+  var pendingExtra = null;
+
+  function assetUrl(prefix, m) {
+    return prefix + m.pkg + '@' + m.ver + '/assets/' + m.file;
+  }
+
+  /* 探一次 model.json：拿到 json 说明这家 CDN 通，拿不到就换下一家。
+     没有 fetch 的内核返回 'blind'，表示探测不了、直接盲用这家。 */
+  function probe(url, ms) {
+    if (!global.fetch || !global.AbortController) return Promise.resolve('blind');
+    return new Promise(function (done) {
+      var ac = new AbortController();
+      var settled = false;
+      var timer = setTimeout(function () {
+        if (settled) return; settled = true;
+        try { ac.abort(); } catch (_) {}
+        done(null);
+      }, ms);
+      fetch(url, { signal: ac.signal }).then(function (r) {
+        if (settled) return;
+        if (!r.ok) { settled = true; clearTimeout(timer); return done(null); }
+        r.json().then(function (j) {
+          if (settled) return; settled = true; clearTimeout(timer); done(j || {});
+        }, function () {
+          if (settled) return; settled = true; clearTimeout(timer); done({});
+        });
+      }, function () {
+        if (settled) return; settled = true; clearTimeout(timer); done(null);
+      });
+    });
+  }
+
+  /* 预热主纹理：纹理是最大的一个文件（izumi 那张 1MB 出头），
+     先下进缓存再 init，组件起来就能直接画，不会空白半天。
+     超时/失败都放行——宁可用慢的，也不留一块空画布。 */
+  function prewarm(base, json, cb, ms) {
+    var tex = json && json.textures && json.textures[0];
+    if (typeof tex !== 'string') return cb();
+    var img = new Image();
+    var done = false;
+    var timer = setTimeout(fin, ms);
+    function fin() {
+      if (done) return; done = true;
+      clearTimeout(timer);
+      img.onload = img.onerror = null;
+      cb();
+    }
+    img.onload = img.onerror = fin;
+    img.src = base + tex;
+  }
+
+  function bootWidget(url, extra) {
+    var opts = {
+      model: { jsonPath: url },
+      display: { position: 'fixed', width: 120, height: 200, hOffset: 0, vOffset: -14 },
+      mobile: { show: true, scale: 0.7 },
+      react: { opacityDefault: 0.9, opacityOnHover: 1 },
+      dialog: false,
+      log: false
+    };
+    if (extra) for (var k in extra) opts[k] = extra[k];
+    global.L2Dwidget.init(opts);
+    attach();
+  }
+
+  /* 依次试：CDN 内轮换 → 该模型所有 CDN 都不通就换下一个模型
+     （并写进 K_MODEL，免得每次刷新都先撞一遍墙）。
+     总预算 25s：最坏情况是全网都不通，不能让页面一直转圈。 */
+  var TOTAL_MS = 25000;
+
+  function start(depth, extra, t0) {
+    depth = depth || 0;
+    t0 = t0 || Date.now();
+    if (depth >= 3 || Date.now() - t0 > TOTAL_MS) return;   // 放弃，安静地不要小人
+    var idx = readIndex();
+    var m = MODELS[idx];
+    var i = 0;
+
+    (function tryCdn() {
+      if (i >= CDNS.length) {
+        store(K_MODEL, String((idx + 1) % MODELS.length));
+        start(depth + 1, extra, t0);
+        return;
+      }
+      var prefix = CDNS[i++];
+      var url = assetUrl(prefix, m);
+      probe(url, PROBE_MS).then(function (json) {
+        if (json === null) return tryCdn();
+        if (json === 'blind') return bootWidget(url, extra);
+        var base = url.slice(0, url.lastIndexOf('/') + 1);
+        prewarm(base, json, function () { bootWidget(url, extra); }, WARM_MS);
+      });
+    })();
+  }
+
+  function init(extra) {
+    global.__l2dInit = true;
+    if (typeof global.L2Dwidget === 'undefined') return false;
+    var idx = readIndex();
+    store(K_MODEL, String(idx));   // 首次随机后就定下来：之后刷新看到的还是这个
+    pendingExtra = extra || null;
+    toastIfSwapped();
+    start(0, pendingExtra);
+    schedulePrefetch();
+    return true;
+  }
+
+  /* 预取「后面第 offset 个」形象。
+     11/15 实测各形象的体积构成：moc 骨架往往比纹理还大（shizuku.moc 675KB，
+     整包 1.7MB），所以 moc 必须一起预取，只备纹理等于白备。 */
+  function fetchWarm(url, cb) {
+    try {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', url, true);
+      xhr.responseType = 'arraybuffer';   // 只要进缓存，内容不解析
+      xhr.onload = xhr.onerror = xhr.ontimeout = xhr.onabort = function () { cb(); };
+      xhr.timeout = PREFETCH_MS;
+      xhr.send();
+    } catch (e) { cb(); }
+  }
+
+  function prefetchOne(offset, cb) {
+    var m = MODELS[(readIndex() + offset) % MODELS.length];
+    var i = 0;
+    (function tryCdn() {
+      if (i >= CDNS.length) return cb();
+      var url = assetUrl(CDNS[i++], m);
+      probe(url, PROBE_MS).then(function (json) {
+        if (json === null) return tryCdn();          // 这家不通，换下一家
+        if (json === 'blind') return cb();           // 探不了就别盲下，省流量
+        var base = url.slice(0, url.lastIndexOf('/') + 1);
+        var jobs = [];
+        if (typeof json.model === 'string') jobs.push({ url: base + json.model, bin: true });
+        (json.textures || []).slice(0, PREFETCH_TEX).forEach(function (t) {
+          if (typeof t === 'string') jobs.push({ url: base + t, bin: false });
+        });
+        if (!jobs.length) return cb();
+        var left = jobs.length;
+        jobs.forEach(function (j) {
+          var done = function () { if (!--left) cb(); };
+          if (j.bin) fetchWarm(j.url, done);          // 骨架走 XHR
+          else {                                      // 纹理走 Image，免 CORS
+            var img = new Image();
+            img.onload = img.onerror = done;
+            img.src = j.url;
+          }
+        });
+      })['catch'](function () { cb(); });
+    })();
+  }
+
+  function schedulePrefetch() {
+    if (PREFETCH <= 0) return;
+    var conn = navigator.connection || {};
+    if (conn.saveData) return;                        // 开了省流量模式就不预取
+    if (/2g/i.test(conn.effectiveType || '')) return;
+    setTimeout(function () {
+      if (document.hidden) return;                    // 切后台了就别下载
+      var k = 1;
+      (function nextOne() {
+        if (k > PREFETCH) return;
+        prefetchOne(k++, nextOne);
+      })();
+    }, PREFETCH_DELAY);
+  }
+
+  global.Live2DHand = {
+    init: init,
+    next: next,
+    models: MODELS,
+    current: function () { return MODELS[readIndex()].name; },
+    resetPos: function () { store(K_POS, null); location.reload(); },
+    resetModel: function () { store(K_MODEL, null); location.reload(); }
+  };
+})(window);
+
+(function () {
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  const conn = navigator.connection || {};
+  if (conn.saveData) return;                       // 开了省流量模式就不拉模型
+
+  const CDNS = [
+    'https://fastly.jsdelivr.net/npm/live2d-widget@3.1.4/lib/L2Dwidget.min.js',
+    'https://cdn.jsdelivr.net/npm/live2d-widget@3.1.4/lib/L2Dwidget.min.js',
+    'https://unpkg.com/live2d-widget@3.1.4/lib/L2Dwidget.min.js'
+  ];
+
+  /* 单家 CDN 等这么久还没回，就当它挂了换下一家。
+     不设上限的话，弱网下会一直「加载中」，看起来就是小人半天不出来。 */
+  const SCRIPT_MS = 8000;
+
+  function drop(node) {
+    if (!node) return;
+    if (node.remove) node.remove();
+    else if (node.parentNode) node.parentNode.removeChild(node);
+  }
+
+  function boot() {
+    let i = 0;
+    (function tryNext() {
+      if (i >= CDNS.length) return;                // 全挂就静静地不要它
+      const s = document.createElement('script');
+      let settled = false;
+      const timer = setTimeout(function () {
+        if (settled) return; settled = true;
+        s.onload = s.onerror = null;
+        drop(s);                                    // 别让它回头又 load 一次
+        tryNext();
+      }, SCRIPT_MS);
+      s.src = CDNS[i++];
+      s.async = true;
+      s.onload = function () {
+        if (settled) return; settled = true;
+        clearTimeout(timer);
+        init();
+      };
+      s.onerror = function () {
+        if (settled) return; settled = true;
+        clearTimeout(timer);
+        drop(s);
+        tryNext();
+      };
+      document.head.appendChild(s);
+    })();
+  }
+
+  function init() {
+    if (typeof Live2DHand === 'undefined') return;
+    Live2DHand.init();      // 形象首次随机，之后记住；点一下换下一个
+  }
+
+  // 等首屏画完再拉，别和熊与粒子抢带宽
+  if ('requestIdleCallback' in window) requestIdleCallback(boot, { timeout: 3000 });
+  else setTimeout(boot, 1500);
+})();
