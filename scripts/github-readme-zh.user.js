@@ -34,7 +34,8 @@
   var MAXQ = 450;      // 单条送翻长度上限（MyMemory 限制 500）
   var MAXBATCH = 12;   // 必应单批最多合并条数
   var MAXLEN = 2400;   // 必应单批最多字符数
-  var GAP = 90;        // 批次间隔，防限流
+  var CONCURRENCY = 2; // 并发批数（必应并发过高会被验证码拦，2 是实测的安全值）
+  var GAP = 60;        // 每条批后的间隔，防限流
 
   var BLOCK_SEL = 'p,h1,h2,h3,h4,h5,h6,li,td,th,blockquote,dd,summary,figcaption';
   var DROP_SEL = 'pre,svg,canvas,img,script,style,.' + CLS;
@@ -119,16 +120,25 @@
 
   /* ---------- 必应 ---------- */
   var bing = { token: null, key: null, at: 0 };
+  var bingPending = null;
 
   async function bingEnsure() {
     if (bing.token && Date.now() - bing.at < 30 * 60e3) return;
-    var r = await gm({ url: 'https://cn.bing.com/translator', headers: { Accept: 'text/html' } });
-    var h = (r && r.responseText) || '';
-    var m = h.match(/params_AbusePreventionHelper\s*=\s*\[(\d+)\s*,\s*"([^"]+)"/);
-    if (!m) throw new Error('bing token not found');
-    bing.key = m[1];
-    bing.token = m[2];
-    bing.at = Date.now();
+    if (bingPending) return bingPending;      // 并发时只抓一次 token
+    bingPending = (async function () {
+      try {
+        var r = await gm({ url: 'https://cn.bing.com/translator', headers: { Accept: 'text/html' } });
+        var h = (r && r.responseText) || '';
+        var m = h.match(/params_AbusePreventionHelper\s*=\s*\[(\d+)\s*,\s*"([^"]+)"/);
+        if (!m) throw new Error('bing token not found');
+        bing.key = m[1];
+        bing.token = m[2];
+        bing.at = Date.now();
+      } finally {
+        bingPending = null;
+      }
+    })();
+    return bingPending;
   }
 
   async function bingOnce(text) {
@@ -225,27 +235,35 @@
     if (cur.length) batches.push(cur);
 
     var done = 0;
-    for (var bi = 0; bi < batches.length; bi++) {
-      var batch = batches[bi];
-      var texts = batch.map(function (j) { return j.text; });
-      var outs = null;
+    var cursor = 0;
 
-      try { outs = await bingTranslate(texts); } catch (e) { outs = null; }
+    async function worker() {
+      while (cursor < batches.length) {
+        var batch = batches[cursor++];
+        var texts = batch.map(function (j) { return j.text; });
+        var outs = null;
 
-      if (!outs) {
-        outs = [];
-        for (var k = 0; k < texts.length; k++) {
-          try { outs.push(await mmTranslate(texts[k])); }
-          catch (e2) { outs.push(''); }
+        try { outs = await bingTranslate(texts); } catch (e) { outs = null; }
+
+        if (!outs) {
+          outs = [];
+          for (var k = 0; k < texts.length; k++) {
+            try { outs.push(await mmTranslate(texts[k])); }
+            catch (e2) { outs.push(''); }
+          }
+          saveCache();
         }
-        saveCache();
-      }
 
-      batch.forEach(function (j, idx) { j.out = outs[idx] || ''; });
-      done += batch.length;
-      if (onProgress) onProgress(done, jobs.length);
-      await sleep(GAP);
+        batch.forEach(function (j, idx) { j.out = outs[idx] || ''; });
+        done += batch.length;
+        if (onProgress) onProgress(done, jobs.length);
+        await sleep(GAP);
+      }
     }
+
+    var runners = [];
+    for (var r = 0; r < CONCURRENCY; r++) runners.push(worker());
+    await Promise.all(runners);
 
     var res = blocks.map(function () { return []; });
     jobs.forEach(function (j) { if (j.out) res[j.bi].push(j.out); });
@@ -298,7 +316,9 @@
       '#ghzh-toggle.busy{opacity:.65}',
       '@media (prefers-color-scheme:dark){#ghzh-toggle{background:#22272e;color:#dadde1;border-color:rgba(255,255,255,.2)}}'
     ].join('');
-    document.head.appendChild(s);
+    var head = document.head || document.documentElement;
+    if (!head) return;
+    head.appendChild(s);
   }
 
   /* ---------- 按钮 ---------- */
@@ -353,17 +373,19 @@
 
   function mount() {
     if (document.getElementById(BTN_ID)) return;
+    var root = document.body;
+    if (!root) return;            // Via 若在 document-start 注入，body 还不存在，等下一轮
     injectCss();
     btn = document.createElement('div');
     btn.id = BTN_ID;
     btn.textContent = '译';
     btn.addEventListener('click', onClick, false);
-    document.body.appendChild(btn);
+    root.appendChild(btn);
   }
 
   /* ---------- 启动 ---------- */
   mount();
-  // GitHub 是 Turbo 导航，切页面不重载 body，按钮可能被清掉，这里兜一下
-  setTimeout(mount, 1500);
-  setTimeout(mount, 4000);
+  // GitHub 用 Turbo 做软导航：切页面不重载 body，按钮偶尔会被内容替换清掉。
+  // 1.5 秒一次的 getElementById 开销可以忽略，比 MutationObserver 稳（按钮被删时也能补）。
+  setInterval(mount, 1500);
 })();
