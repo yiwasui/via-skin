@@ -14,15 +14,3 @@ https://fastly.jsdelivr.net/gh/yiwasui/via-skin@main/live2d.js
 这样改脚本不用重新粘贴整个 homepage.html（Via 的皮肤编辑器只支持粘贴，
 太长的文本贴不进去）。
 
-## scripts/
-
-`github-readme-zh.user.js` —— 独立的 Via 用户脚本（跟皮肤无关，别混）。
-在 GitHub 的 README / Issue 正文每段下方插入中文译文，原文不动，右下角
-「译」按钮开关。主源走必应、兜底 MyMemory。
-
-安装地址（手机 Via 直接打开即可识别为脚本）：
-
-```
-https://fastly.jsdelivr.net/gh/yiwasui/via-skin@main/scripts/github-readme-zh.user.js
-```
-
