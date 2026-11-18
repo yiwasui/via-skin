@@ -48,14 +48,14 @@
   // 自托管模型的地址前缀（via-skin 仓库根）。npm 那六家对它是无效的 ——
   // 包名不存在，所以单独一组，同样三家 jsDelivr 域名轮试。
   var GH = [
-    'https://fastly.jsdelivr.net/gh/yiwasui/via-skin@main/',
-    'https://cdn.jsdelivr.net/gh/yiwasui/via-skin@main/',
-    'https://gcore.jsdelivr.net/gh/yiwasui/via-skin@main/',
-    // 最后兜底：公共反代（拼在 raw 地址前即可）。jsDelivr 若把某个文件挡成 301，
-    // 这条能救回来 —— 公共镜像随时可能挂，只能垫底。
-    'https://gh-proxy.com/https://raw.githubusercontent.com/yiwasui/via-skin/main/'
+    // ⚠️ 不能用 jsDelivr：它对 gh 源里的**图片**一律 301 到 raw.githubusercontent，
+    //    手机（国内）拿不到 → 模型渲染不出来。npm 源没这问题，所以老模型仍走 CDNS。
+    //    只剩公共反代能用，四家轮试，全挂就让 start() 换下一个形象。
+    'https://gh-proxy.com/https://raw.githubusercontent.com/yiwasui/via-skin/main/',
+    'https://ghfast.top/https://raw.githubusercontent.com/yiwasui/via-skin/main/',
+    'https://ghproxy.net/https://raw.githubusercontent.com/yiwasui/via-skin/main/',
+    'https://ghproxy.cc/https://raw.githubusercontent.com/yiwasui/via-skin/main/'
   ];
-
   /* 11/18：她反馈“有时候半天才加载出来”。原来单次探址 6s、六家轮着撞，
      最坏 36s 全花在等超时上。降到 3.5s，并记住上次探通的那一家 —— 同一网络
      下次直接从它开始，省掉前面几次空等。 */

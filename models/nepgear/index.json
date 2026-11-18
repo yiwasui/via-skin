@@ -2,10 +2,10 @@
  "version": "Sample 1.0.0",
  "model": "model.moc",
  "textures": [
-  "textures/00.png",
-  "textures/01.png",
-  "textures/02.png",
-  "textures/03.png"
+  "textures/00.webp",
+  "textures/01.webp",
+  "textures/02.webp",
+  "textures/03.webp"
  ],
  "pose": "pose.json",
  "physics": "physics.json",
