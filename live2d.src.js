@@ -19,28 +19,20 @@
 
   // 换形象的顺序表。点一下小人切到下一个；首访随机起始，之后记住。
   // 加/减形象只动这里：pkg + ver + file 拼成资源地址（前缀见下面 CDNS）。
-  // ver 每个包不一样 —— umaru 2.0.0、rem 1.0.1、sagiri/mikoto 1.0.0，其余 1.0.5。
+  // ver 每个包不一样 —— rem 1.0.1、sagiri/mikoto 1.0.0；带 path 的走自托管，不用 pkg/ver。
   // 写错版本号会 404，加新形象前先用 assets/<name>.model.json 验一遍。
-  // 体积（11/15 实测，主纹理+动作+音效求和，弱网下越大越慢）：
-  //   z16 .23M / unitychan .38M / ni-j .66M / hibiki .69M / nico .90M / miku .95M
-  //   nipsilon 1.06M / mikoto 1.11M / sagiri 1.24M / tsumiki 1.31M / rem 1.33M
-  //   shizuku 2.60M / umaru 2.85M
+  // 体积（贴图已转 WebP，弱网下越大越慢）：
+  //   murakumo 0.44M / mikoto 1.11M / nepgear 1.21M / sagiri 1.24M / rem 1.33M
   var MODELS = [
-    { name: 'unitychan', pkg: 'live2d-widget-model-unitychan', ver: '1.0.5', file: 'unitychan.model.json' },
-    { name: 'shizuku',   pkg: 'live2d-widget-model-shizuku',   ver: '1.0.5', file: 'shizuku.model.json' },
-    { name: 'z16',       pkg: 'live2d-widget-model-z16',       ver: '1.0.5', file: 'z16.model.json' },
-    { name: 'hibiki',    pkg: 'live2d-widget-model-hibiki',    ver: '1.0.5', file: 'hibiki.model.json' },
-    { name: 'miku',      pkg: 'live2d-widget-model-miku',      ver: '1.0.5', file: 'miku.model.json' },
-    { name: 'nico',      pkg: 'live2d-widget-model-nico',      ver: '1.0.5', file: 'nico.model.json' },
-    { name: 'ni-j',      pkg: 'live2d-widget-model-ni-j',      ver: '1.0.5', file: 'ni-j.model.json' },
-    { name: 'nipsilon',  pkg: 'live2d-widget-model-nipsilon',  ver: '1.0.5', file: 'nipsilon.model.json' },
-    { name: 'tsumiki',   pkg: 'live2d-widget-model-tsumiki',   ver: '1.0.5', file: 'tsumiki.model.json' },
-    { name: 'umaru',     pkg: 'live2d-widget-model-umaru',     ver: '2.0.0', file: 'umaru.model.json' },
-    { name: 'rem',       pkg: 'live2d-widget-model-rem',       ver: '1.0.1', file: 'rem.model.json' },
-    { name: 'sagiri',    pkg: 'live2d-widget-model-sagiri',    ver: '1.0.0', file: 'sagiri.model.json' },
-    { name: 'mikoto',    pkg: 'live2d-widget-model-mikoto',    ver: '1.0.0', file: 'mikoto.model.json' }
+    // 2026-11-18 她的意思：老模型看腻了，只留 rem / sagiri / mikoto 三个，
+    // 另外两个换成自托管的（贴图转 WebP，见下）。
+    { name: 'rem',      pkg: 'live2d-widget-model-rem',      ver: '1.0.1', file: 'rem.model.json' },
+    { name: 'sagiri',   pkg: 'live2d-widget-model-sagiri',   ver: '1.0.0', file: 'sagiri.model.json' },
+    { name: 'mikoto',   pkg: 'live2d-widget-model-mikoto',   ver: '1.0.0', file: 'mikoto.model.json' },
+    // 这两个是从社区库挪进本仓库的（npm 上没有），path 相对仓库根
+    { name: 'murakumo', path: 'models/murakumo/index.json' },
+    { name: 'nepgear',  path: 'models/nepgear/index.json' }
   ];
-
   // 资源 CDN，按顺序试。jsdelivr 的三个域名轮着试完再退到 unpkg。
   // 末尾两家是 jsdelivr 的国内公共反代 —— 公共镜像随时可能挂，只当最后兜底。
   // ⚠️ 别再往这里加 npmmirror：阿里那套有包名白名单，live2d-widget-model-*
@@ -53,6 +45,14 @@
     'https://cdn.jsdmirror.com/npm/',
     'https://jsd.onmicrosoft.cn/npm/'
   ];
+  // 自托管模型的地址前缀（via-skin 仓库根）。npm 那六家对它是无效的 ——
+  // 包名不存在，所以单独一组，同样三家 jsDelivr 域名轮试。
+  var GH = [
+    'https://fastly.jsdelivr.net/gh/yiwasui/via-skin@main/',
+    'https://cdn.jsdelivr.net/gh/yiwasui/via-skin@main/',
+    'https://gcore.jsdelivr.net/gh/yiwasui/via-skin@main/'
+  ];
+
   /* 11/18：她反馈“有时候半天才加载出来”。原来单次探址 6s、六家轮着撞，
      最坏 36s 全花在等超时上。降到 3.5s，并记住上次探通的那一家 —— 同一网络
      下次直接从它开始，省掉前面几次空等。 */
@@ -294,7 +294,13 @@
 
   var pendingExtra = null;
 
+  /* 一个形象的资源地址。npm 包和自托管仓库两种来源，前缀不同：
+       npm  = <CDN>/<pkg>@<ver>/assets/<file>
+       gh   = <GH>/models/<name>/index.json（path 里已带全相对路径） */
+  function hostsFor(m) { return m.path ? GH : CDNS; }
+
   function assetUrl(prefix, m) {
+    if (m.path) return prefix + m.path;
     return prefix + m.pkg + '@' + m.ver + '/assets/' + m.file;
   }
 
@@ -375,11 +381,11 @@
 
   /* 上次探通的那一家排最前，其余按原顺序跟上。它这次要是不通，
      第一轮失败就把它忘掉，免得以后每次都先撞一次墙。 */
-  function cdnOrder() {
+  function cdnOrder(hosts) {
     var good = parseInt(store(K_CDN), 10);
     var order = [];
-    if (isFinite(good) && good >= 0 && good < CDNS.length) order.push(good);
-    for (var i = 0; i < CDNS.length; i++) if (i !== good) order.push(i);
+    if (isFinite(good) && good >= 0 && good < hosts.length) order.push(good);
+    for (var i = 0; i < hosts.length; i++) if (i !== good) order.push(i);
     return order;
   }
 
@@ -389,7 +395,8 @@
     if (depth >= 3 || Date.now() - t0 > TOTAL_MS) return;   // 放弃，安静地不要小人
     var idx = readIndex();
     var m = MODELS[idx];
-    var order = cdnOrder();
+    var hosts = hostsFor(m);
+    var order = cdnOrder(hosts);
     var firstTry = true;
     var i = 0;
 
@@ -400,7 +407,7 @@
         return;
       }
       var ci = order[i++];
-      var url = assetUrl(CDNS[ci], m);
+      var url = assetUrl(hosts[ci], m);
       probe(url, PROBE_MS).then(function (json) {
         if (json === null) {
           if (firstTry) store(K_CDN, null);   // 记住的那家不灵了
@@ -443,10 +450,11 @@
 
   function prefetchOne(offset, cb) {
     var m = MODELS[(readIndex() + offset) % MODELS.length];
+    var hosts = hostsFor(m);
     var i = 0;
     (function tryCdn() {
-      if (i >= CDNS.length) return cb();
-      var url = assetUrl(CDNS[i++], m);
+      if (i >= hosts.length) return cb();
+      var url = assetUrl(hosts[i++], m);
       probe(url, PROBE_MS).then(function (json) {
         if (json === null) return tryCdn();          // 这家不通，换下一家
         if (json === 'blind') return cb();           // 探不了就别盲下，省流量
