@@ -53,10 +53,14 @@
     'https://cdn.jsdmirror.com/npm/',
     'https://jsd.onmicrosoft.cn/npm/'
   ];
-  var PROBE_MS = 6000;   // 单次探 model.json 的上限
-  var WARM_MS  = 9000;   // 等主纹理进缓存的上限（超时也照样 init，别无限等）
+  /* 11/18：她反馈“有时候半天才加载出来”。原来单次探址 6s、六家轮着撞，
+     最坏 36s 全花在等超时上。降到 3.5s，并记住上次探通的那一家 —— 同一网络
+     下次直接从它开始，省掉前面几次空等。 */
+  var PROBE_MS = 3500;   // 单次探 model.json 的上限
+  var WARM_MS  = 9000;   // 等纹理/moc 进缓存的上限（超时也照样 init，别无限等）
 
   var K_MODEL = 'l2d:model';   // 上次是第几个形象
+  var K_CDN   = 'l2d:cdn';     // 上次探通的 CDN 下标（下次优先用）
   var K_POS   = 'l2d:pos';     // 上次拖到的位置 {x,y}
   var K_SWAP  = 'l2d:swapped'; // 刚换过形象（只用来弹一次名字）
   var TAP_TOL = 6;             // 手指移动小于这个距离算「点一下」
@@ -144,6 +148,10 @@
     mo.observe(host, { attributes: true, attributeFilter: ['style'] });
     lockTimers.push(mo);
     reapply();
+    /* 只守前 4 秒：组件改写 style 的时机集中在初始化阶段。之后还盯着，
+       它内部一改动画我们就硬推回去，两边互相打架 —— 表现就是人物偶尔抖一下、
+       画面上留下挪动的残影。 */
+    lockTimers.push(setTimeout(stopLock, 4000));
   }
 
   function stopLock() {
@@ -261,8 +269,12 @@
         lockPos(host);
         bindDrag(host, next);
         // 转屏/缩放后把位置夹回可视区
-        var rt = 0;
+        /* 只认宽度变化。手机上点搜索框弹键盘，viewport 高度会变、宽度不变，
+           原来那版照样重算位置 —— 她看到的“人物位置突然偏移”就是这么来的。 */
+        var rt = 0, lastW = global.innerWidth;
         global.addEventListener('resize', function () {
+          if (Math.abs(global.innerWidth - lastW) < 2) return;
+          lastW = global.innerWidth;
           clearTimeout(rt);
           rt = setTimeout(function () {
             var r = host.getBoundingClientRect();
@@ -312,23 +324,34 @@
     });
   }
 
-  /* 预热主纹理：纹理是最大的一个文件（izumi 那张 1MB 出头），
-     先下进缓存再 init，组件起来就能直接画，不会空白半天。
+  /* 预热：纹理 + moc 骨架一起先下进 HTTP 缓存，再 init。
+     原来只备纹理，可组件 init 之后还要下 moc —— shizuku 的 moc 有 675KB，
+     占整包四成，于是照样白屏半天。两个都备上，组件起来直接命中缓存。
      超时/失败都放行——宁可用慢的，也不留一块空画布。 */
   function prewarm(base, json, cb, ms) {
+    var urls = [];
     var tex = json && json.textures && json.textures[0];
-    if (typeof tex !== 'string') return cb();
-    var img = new Image();
-    var done = false;
+    if (typeof tex === 'string') urls.push(base + tex);
+    var moc = json && json.model;
+    if (typeof moc === 'string') urls.push(base + moc);
+    if (!urls.length) return cb();
+
+    var left = urls.length, done = false;
     var timer = setTimeout(fin, ms);
     function fin() {
       if (done) return; done = true;
       clearTimeout(timer);
-      img.onload = img.onerror = null;
       cb();
     }
-    img.onload = img.onerror = fin;
-    img.src = base + tex;
+    function tick() { if (!done && --left <= 0) fin(); }
+    for (var k = 0; k < urls.length; k++) {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', urls[k], true);
+      xhr.responseType = 'arraybuffer';
+      xhr.onload = xhr.onerror = xhr.ontimeout = xhr.onabort = tick;
+      xhr.timeout = ms;
+      xhr.send();
+    }
   }
 
   function bootWidget(url, extra) {
@@ -350,24 +373,41 @@
      总预算 25s：最坏情况是全网都不通，不能让页面一直转圈。 */
   var TOTAL_MS = 25000;
 
+  /* 上次探通的那一家排最前，其余按原顺序跟上。它这次要是不通，
+     第一轮失败就把它忘掉，免得以后每次都先撞一次墙。 */
+  function cdnOrder() {
+    var good = parseInt(store(K_CDN), 10);
+    var order = [];
+    if (isFinite(good) && good >= 0 && good < CDNS.length) order.push(good);
+    for (var i = 0; i < CDNS.length; i++) if (i !== good) order.push(i);
+    return order;
+  }
+
   function start(depth, extra, t0) {
     depth = depth || 0;
     t0 = t0 || Date.now();
     if (depth >= 3 || Date.now() - t0 > TOTAL_MS) return;   // 放弃，安静地不要小人
     var idx = readIndex();
     var m = MODELS[idx];
+    var order = cdnOrder();
+    var firstTry = true;
     var i = 0;
 
     (function tryCdn() {
-      if (i >= CDNS.length) {
+      if (i >= order.length) {
         store(K_MODEL, String((idx + 1) % MODELS.length));
         start(depth + 1, extra, t0);
         return;
       }
-      var prefix = CDNS[i++];
-      var url = assetUrl(prefix, m);
+      var ci = order[i++];
+      var url = assetUrl(CDNS[ci], m);
       probe(url, PROBE_MS).then(function (json) {
-        if (json === null) return tryCdn();
+        if (json === null) {
+          if (firstTry) store(K_CDN, null);   // 记住的那家不灵了
+          firstTry = false;
+          return tryCdn();
+        }
+        store(K_CDN, String(ci));
         if (json === 'blind') return bootWidget(url, extra);
         var base = url.slice(0, url.lastIndexOf('/') + 1);
         prewarm(base, json, function () { bootWidget(url, extra); }, WARM_MS);
