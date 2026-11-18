@@ -50,7 +50,10 @@
   var GH = [
     'https://fastly.jsdelivr.net/gh/yiwasui/via-skin@main/',
     'https://cdn.jsdelivr.net/gh/yiwasui/via-skin@main/',
-    'https://gcore.jsdelivr.net/gh/yiwasui/via-skin@main/'
+    'https://gcore.jsdelivr.net/gh/yiwasui/via-skin@main/',
+    // 最后兜底：公共反代（拼在 raw 地址前即可）。jsDelivr 若把某个文件挡成 301，
+    // 这条能救回来 —— 公共镜像随时可能挂，只能垫底。
+    'https://gh-proxy.com/https://raw.githubusercontent.com/yiwasui/via-skin/main/'
   ];
 
   /* 11/18：她反馈“有时候半天才加载出来”。原来单次探址 6s、六家轮着撞，
