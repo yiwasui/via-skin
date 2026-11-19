@@ -18,12 +18,33 @@
   // 换形象的顺序表。点一下小人切到下一个；首访随机起始，之后记住。
   // 全部是自托管的 Cubism 4 模型：path 相对仓库根，模型目录自包含。
   // 体积（贴图已转 WebP）：haru 0.89M / hiyori 1.09M / rice 1.31M / mao 1.50M
+  // kind 决定用哪套引擎：c2 = Cubism 2（.model.json / index.json），c4 = Cubism 3/4/5（.model3.json）。
+  // 两套各拉各的，只出一个小人，另一套的脚本不会下载。
+  // fit = 模型「实际画出东西」的范围 [x, y, w, h]（模型坐标，y 向下）。
+  // 各家画布留白差别极大（nepgear 人只占画布右下角五分之一，sagiri 几乎顶满），
+  // 按画布缩会一个变火柴人一个被切掉。这张表是 2026-11-19 用 _measure_ink.js
+  // 把每个模型渲成透明 PNG、量 alpha 包围盒得到的；换模型要重量。
   var MODELS = [
-    { name: 'haru',   path: 'models/haru/Haru.model3.json' },
-    { name: 'hiyori', path: 'models/hiyori/Hiyori.model3.json' },
-    // Rice 在画布里画得比别的模型小一圈，单独给个放大系数，否则缩成火柴人
-    { name: 'rice',   path: 'models/rice/Rice.model3.json', zoom: 1.9 },
-    { name: 'mao',    path: 'models/mao/Mao.model3.json' }
+    // ---- 原来的 5 个（Cubism 2）----
+    { name: 'rem',      kind: 'c2', pkg: 'live2d-widget-model-rem',    ver: '1.0.1', file: 'rem.model.json',
+      fit: [707, 201, 1117, 2847] },
+    { name: 'sagiri',   kind: 'c2', pkg: 'live2d-widget-model-sagiri', ver: '1.0.0', file: 'sagiri.model.json',
+      fit: [21, 0, 1179, 2132] },
+    { name: 'mikoto',   kind: 'c2', pkg: 'live2d-widget-model-mikoto', ver: '1.0.0', file: 'mikoto.model.json',
+      fit: [400, 306, 515, 694], zoom: 1.09 },
+    { name: 'murakumo', kind: 'c2', path: 'models/murakumo/index.json',
+      fit: [204, 27, 535, 997] },
+    { name: 'nepgear',  kind: 'c2', path: 'models/nepgear/index.json',
+      fit: [1040, 2345, 1645, 2542] },
+    // ---- 2026-11-19 新增（Cubism 4，官方样例）----
+    { name: 'haru',     kind: 'c4', path: 'models/haru/Haru.model3.json',
+      fit: [775, 232, 870, 3980] },
+    { name: 'hiyori',   kind: 'c4', path: 'models/hiyori/Hiyori.model3.json',
+      fit: [1032, 327, 968, 3743] },
+    { name: 'rice',     kind: 'c4', path: 'models/rice/Rice.model3.json',
+      fit: [2628, 410, 904, 2432] },
+    { name: 'mao',      kind: 'c4', path: 'models/mao/Mao.model3.json',
+      fit: [215, 770, 4325, 7440] }
   ];
 
   // 引擎脚本，按顺序加载（core → pixi → display，顺序不能换，见 ensureEngine）。
@@ -40,14 +61,24 @@
     for (var i = 0; i < NPM.length; i++) out.push(NPM[i] + rel);
     return out;
   }
+  // 两套引擎：c4 给 moc3，c2 给老的 .model.json。共用一个 pixi。
+  // c2 的 core 是 Cubism 2 的 live2d.min.js（官方早停更，社区留着 gh 镜像）。
   var ENGINE = {
-    core: [
-      'https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js',
-      'https://fastly.jsdelivr.net/npm/live2dcubismcore@1.0.2/live2dcubismcore.min.js',
-      'https://unpkg.com/live2dcubismcore@1.0.2/live2dcubismcore.min.js'
-    ],
-    pixi: npmAll('pixi.js@6.5.10/dist/browser/pixi.min.js'),
-    display: npmAll('pixi-live2d-display@0.4.0/dist/cubism4.min.js')
+    c4: {
+      core: [
+        'https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js',
+        'https://fastly.jsdelivr.net/npm/live2dcubismcore@1.0.2/live2dcubismcore.min.js',
+        'https://unpkg.com/live2dcubismcore@1.0.2/live2dcubismcore.min.js'
+      ],
+      pixi: npmAll('pixi.js@6.5.10/dist/browser/pixi.min.js'),
+      display: npmAll('pixi-live2d-display@0.4.0/dist/cubism4.min.js')
+    },
+    // 老模型仍用 live2d-widget 3.1.4（它自带的 pixi4 + Cubism2 core）。
+    // 试过把它塞进 pixi6：缩放口径、画布裁切全对不上，五个老模型没一个长得和原来一样。
+    // 与其硬凑，不如两套各管各的 —— 反正一次只出一个小人。
+    c2: {
+      widget: npmAll('live2d-widget@3.1.4/lib/L2Dwidget.min.js')
+    }
   };
   // 自托管模型的地址前缀（via-skin 仓库根）。
   // ⚠️ 别用 jsDelivr 的 gh 源：它对仓库里的**图片**一律 301 到 raw.githubusercontent，
@@ -254,7 +285,7 @@
 
   /* ---------------- 容器与渲染 ---------------- */
 
-  var view = { app: null, model: null, host: null, w: 0, zoom: 1 };
+  var view = { app: null, model: null, host: null, w: 0, zoom: 1, kind: 'c4', entry: null };
 
   function ensureHost() {
     var host = document.getElementById('live2d-widget');
@@ -276,6 +307,7 @@
 
   function fit() {
     var app = view.app, model = view.model, host = view.host;
+    // 老引擎自己管尺寸，别插手
     if (!app || !model || !host) return;
     var b = boxSize(), W = b.w, H = b.h;
 
@@ -283,18 +315,24 @@
     host.style.height = H + 'px';
     app.renderer.resize(W, H);
 
-    // 按**实际画出来的范围**缩放，不用画布尺寸：官方样例的画布留白各不相同
-    // （Rice 的画布大、人小，按画布缩就缩成一个火柴人）。
-    model.scale.set(1);
-    model.position.set(0, 0);
-    var bb = null;
-    try { model.update(0); bb = model.getLocalBounds(); } catch (_) {}
+    var m = view.entry || {};
     var im = model.internalModel;
-    var x0 = 0, y0 = 0;
-    var w0 = (im && im.originalWidth) || model.width || 1;
-    var h0 = (im && im.originalHeight) || model.height || 1;
-    if (bb && bb.width > 1 && bb.height > 1) {
-      x0 = bb.x; y0 = bb.y; w0 = bb.width; h0 = bb.height;
+    var ow = (im && im.originalWidth) || model.width || 1;
+    var oh = (im && im.originalHeight) || model.height || 1;
+
+    // 有实测墨迹就用墨迹（所有模型统一口径，看起来一样大、一样站在框底）；
+    // 没量过的退回画布四角，至少不会缩成点。
+    var x0, y0, w0, h0;
+    // ⚠️ 老模型（c2）不用墨迹表：它们的画布就是可见范围，按画布走才不会把下半身
+    //    顶到画布外被裁掉（mikoto 就栽在这，只露一个胸像）。c4 才用墨迹。
+    if (m.fit && view.kind !== 'c2') {
+      var pad = 0.04;
+      x0 = m.fit[0] - m.fit[2] * pad;
+      y0 = m.fit[1] - m.fit[3] * pad;
+      w0 = m.fit[2] * (1 + pad * 2);
+      h0 = m.fit[3] * (1 + pad * 2);
+    } else {
+      x0 = 0; y0 = 0; w0 = ow; h0 = oh;
     }
 
     var s = Math.min(W * 0.96 / w0, H * 0.98 / h0) * (view.zoom || 1);
@@ -306,7 +344,7 @@
 
   /* ---------------- 引擎脚本：用到才拉 ---------------- */
 
-  var engineReady = null;
+  var engineReady = {};
 
   function loadScript(urls) {
     return new Promise(function (done, fail) {
@@ -339,25 +377,51 @@
     });
   }
 
-  function ensureEngine() {
-    if (engineReady) return engineReady;
-    // ⚠️ 顺序不能换：pixi-live2d-display 的 cubism4 插件在**脚本加载那一刻**就检查
-    //    Live2DCubismCore 是否已存在，core 后加载会报
-    //    "Could not find Cubism 4 runtime"。所以 core → pixi → display。
-    engineReady = loadScript(ENGINE.core)
-      .then(function () { return loadScript(ENGINE.pixi); })
-      .then(function () { return loadScript(ENGINE.display); });
-    return engineReady;
+  function ensureEngine(kind) {
+    if (engineReady[kind]) return engineReady[kind];
+    var e = ENGINE[kind];
+    if (e.widget) {
+      engineReady[kind] = loadScript(e.widget);   // 老引擎：一个脚本搞定
+      return engineReady[kind];
+    }
+    // ⚠️ 顺序不能换：pixi-live2d-display 的插件在**脚本加载那一刻**就检查对应运行时，
+    //    core 后加载会报 "Could not find Cubism 4 runtime"。core → pixi → display。
+    engineReady[kind] = loadScript(e.core)
+      .then(function () { return loadScript(e.pixi); })
+      .then(function () { return loadScript(e.display); });
+    return engineReady[kind];
   }
 
   /* ---------------- 建渲染器 ---------------- */
 
-  function bootModel(url, zoom) {
-    return ensureEngine().then(function () {
+  /* 老引擎：交给 L2Dwidget 自己建 DOM（它会造 #live2d-widget），尺寸沿用 120×200，
+     和 11-18 之前一模一样。 */
+  function bootOld(url) {
+    return ensureEngine('c2').then(function () {
+      if (!global.L2Dwidget) throw new Error('no L2Dwidget');
+      global.L2Dwidget.init({
+        model: { jsonPath: url },
+        display: { position: 'fixed', width: 120, height: 200, hOffset: 0, vOffset: -14 },
+        mobile: { show: true, scale: 0.7 },
+        react: { opacityDefault: 0.9, opacityOnHover: 1 },
+        dialog: false,
+        log: false
+      });
+      attach();
+      return global.L2Dwidget;
+    });
+  }
+
+  function bootModel(url, entry) {
+    entry = entry || {};
+    if ((entry.kind || 'c4') === 'c2') return bootOld(url);
+    return ensureEngine(entry.kind || 'c4').then(function () {
       var PIXI = global.PIXI;
       if (!PIXI || !PIXI.live2d) throw new Error('no pixi live2d');
 
-      view.zoom = zoom || 1;
+      view.zoom = entry.zoom || 1;
+      view.kind = entry.kind || 'c4';
+      view.entry = entry;
       var host = ensureHost();
       var b = boxSize();
       host.style.width = b.w + 'px';
@@ -379,9 +443,15 @@
         view.model = model;
         fit();
         // 待机动作：官方样例都带 Idle 组，随机播一条，播完自动轮换
+        // 待机动作：官方样例叫 Idle，老模型有 idle / 其他叫法，挑一个能用的
         try {
           var mm = model.internalModel && model.internalModel.motionManager;
-          if (mm && mm.groups && Object.keys(mm.groups).length) model.motion('Idle');
+          var gs = mm && mm.groups ? Object.keys(mm.groups) : [];
+          if (gs.length) {
+            var g = gs.indexOf('Idle') >= 0 ? 'Idle' : null;
+            for (var gi = 0; !g && gi < gs.length; gi++) if (/idle/i.test(gs[gi])) g = gs[gi];
+            model.motion(g || gs[0]);
+          }
         } catch (_) {}
         attach();
         return model;
@@ -528,7 +598,7 @@
         }
         store(K_CDN, String(ci));
         var go = function () {
-          bootModel(url, m.zoom).then(null, function () {
+          bootModel(url, m).then(null, function () {
             store(K_MODEL, String((idx + 1) % MODELS.length));
             start(depth + 1, t0);
           });
